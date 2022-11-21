@@ -14,9 +14,35 @@ import yaml
 from asyncio_mqtt import Client as MqttClient, MqttError
 from bestlog import logger as bestlog
 from kasa import SmartPlug, SmartStrip
+from prometheus_client import Enum as State, Gauge, Histogram, start_http_server
 from pydantic import BaseModel, BaseSettings
 
 logger = bestlog.get("kasa-plug-exporter")
+
+MQTT_PUBLISH_TIME = Histogram(
+    "mqtt_publish_duration_seconds", "Duration of publishing status updates to MQTT"
+)
+KASA_UPDATE_TIME = Histogram(
+    "kasa_update_duration_seconds", "Duration to update Kasa smart device information"
+)
+KASA_PLUG_STATE = State(
+    "kasa_plug_state",
+    "Tracks the state of a plug/outlet",
+    states=["on", "off"],
+    labelnames=["name"],
+)
+KASA_PLUG_EMETER_CURRENT = Gauge(
+    "kasa_plug_emeter_current", "Realtime current in A", labelnames=["name"]
+)
+KASA_PLUG_EMETER_VOLTAGE = Gauge(
+    "kasa_plug_emeter_voltage", "Realtime voltage in V", labelnames=["name"]
+)
+KASA_PLUG_EMETER_POWER = Gauge(
+    "kasa_plug_emeter_power", "Realtime power in W", labelnames=["name"]
+)
+KASA_PLUG_EMETER_TOTAL_KWH = Gauge(
+    "kasa_plug_emeter_total_kwh", "Total power consumption in kWh", labelnames=["name"]
+)
 
 
 class MQTTPublisher:
@@ -36,7 +62,8 @@ class MQTTPublisher:
                 ) as client:
                     while True:
                         item: MqttMessage = await self.__queue.get()
-                        await client.publish(item.topic, item.payload.json())
+                        with MQTT_PUBLISH_TIME.time():
+                            await client.publish(item.topic, item.payload.json())
                         logger.debug(
                             "Published status update to MQTT topic %s: %s",
                             item.topic,
@@ -104,7 +131,8 @@ class DeviceMonitor:
 
     async def _update(self) -> None:
         logger.debug("Reading current state of %s", self.__name)
-        await self.__device.update()
+        with KASA_UPDATE_TIME.time():
+            await self.__device.update()
 
         # Main plug/strip
         payload = Payload(on=self.__device.is_on)
@@ -117,6 +145,12 @@ class DeviceMonitor:
                 total_kwh=self.__device.emeter_realtime.total or 0.0,
             )
 
+        KASA_PLUG_STATE.labels(name=self.__name).state("on" if payload.on else "off")
+        KASA_PLUG_EMETER_CURRENT.labels(name=self.__name).set(payload.current)
+        KASA_PLUG_EMETER_VOLTAGE.labels(name=self.__name).set(payload.voltage)
+        KASA_PLUG_EMETER_POWER.labels(name=self.__name).set(payload.power)
+        KASA_PLUG_EMETER_TOTAL_KWH.labels(name=self.__name).set(payload.total_kwh)
+
         await self.__queue.put(
             MqttMessage(
                 topic=f"kasa/{self.__name}/status",
@@ -128,6 +162,7 @@ class DeviceMonitor:
         if self.__device.is_strip:
             for idx, plug in enumerate(self.__device.children):
                 plug_id = idx + 1
+                name = plug.alias or f"{self.__name} - {plug_id}"
                 topic = f"kasa/{self.__name}/{plug_id:02}/status"
                 payload = Payload(on=plug.is_on)
                 if plug.has_emeter:
@@ -139,6 +174,11 @@ class DeviceMonitor:
                         total_kwh=plug.emeter_realtime.total or 0.0,
                     )
 
+                KASA_PLUG_STATE.labels(name=name).state("on" if payload.on else "off")
+                KASA_PLUG_EMETER_CURRENT.labels(name=name).set(payload.current)
+                KASA_PLUG_EMETER_VOLTAGE.labels(name=name).set(payload.voltage)
+                KASA_PLUG_EMETER_POWER.labels(name=name).set(payload.power)
+                KASA_PLUG_EMETER_TOTAL_KWH.labels(name=name).set(payload.total_kwh)
                 await self.__queue.put(
                     MqttMessage(
                         topic=topic,
@@ -208,6 +248,7 @@ def main(config_file: click.File, debug: bool = False) -> None:
     config = yaml.safe_load(config_file)
     settings = Settings(**config)
 
+    start_http_server(8000)
     asyncio.run(_main(settings=settings, debug=debug))
 
 
